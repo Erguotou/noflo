@@ -85,6 +85,8 @@ class Component extends EventEmitter
     for inPort in @forwardBracketsFrom
       @bracketCounter[inPort] = 0
     @forwardBracketsTo = (p for p in @forwardBracketsTo when p of @outPorts.ports)
+    for outPort in @forwardBracketsTo
+      @bracketBuffer[outPort] = {}
 
   incFwdCounter: (scope, port) ->
     @fwdBracketCounter[scope] = {} unless scope of @fwdBracketCounter
@@ -100,6 +102,10 @@ class Component extends EventEmitter
   getFwdCounter: (scope, port) ->
     return 0 unless @fwdBracketCounter[scope]?[port]
     return @fwdBracketCounter[scope][port]
+
+  putIPToFwdBuffer: (port, ip) ->
+    @bracketBuffer[port][ip.scope] = [] unless ip.scope of @bracketBuffer[port]
+    @bracketBuffer[port][ip.scope].push ip
 
   # Sets process handler function
   process: (handle) ->
@@ -124,21 +130,20 @@ class Component extends EventEmitter
     if @forwardBracketsFrom.indexOf(port.name) isnt -1 and
     (ip.type is 'openBracket' or ip.type is 'closeBracket')
       # Bracket forwarding
-      @bracketBuffer[ip.scope] = [] unless ip.scope of @bracketBuffer
-      # Closing brackets coming afterwards are just forwarded
-      if ip.type is 'closeBracket' and @bracketBuffer[ip.scope].length is 0
-        outputEntry =
-          __resolved: true
-        for outPort, count of @fwdBracketCounter[ip.scope]
-          if count > 0
+      outputEntry =
+        __resolved: true
+      for outPort in @forwardBracketsTo
+        # Closing brackets coming afterwards are just forwarded
+        if ip.type is 'closeBracket' and @bracketBuffer[outPort][ip.scope].length is 0
+          if @fwdBracketCounter[ip.scope][outPort] > 0
             outputEntry[outPort] = [] unless outPort of outputEntry
             outputEntry[outPort].push ip
             @decFwdCounter ip.scope, outPort
-        if Object.keys(outputEntry).length > 1
-          @outputQ.push outputEntry
-          @processOutputQueue()
-      else
-        @bracketBuffer[ip.scope].push ip
+        else
+          @putIPToFwdBuffer outPort, ip
+      if Object.keys(outputEntry).length > 1
+        @outputQ.push outputEntry
+        @processOutputQueue()
       if ip.scope?
         port.scopedBuffer[ip.scope].pop()
       else
@@ -288,7 +293,7 @@ class PortBuffer
 class ProcessOutput
   constructor: (@ports, @ip, @nodeInstance, @result) ->
     @scope = @ip.scope
-    @bracketsToForward = null
+    @bracketsToForward = {}
     @forwardedBracketsTo = []
 
   # Sets component state to `activated`
@@ -327,33 +332,32 @@ class ProcessOutput
     else
       @nodeInstance.outPorts[port].sendIP ip
 
-  prepareOpenBrackets: ->
-    @bracketsToForward = []
+  prepareOpenBrackets: (port) ->
+    return if port of @bracketsToForward # already prepared
+    @bracketsToForward[port] = []
     hasOpening = false
-    while @nodeInstance.bracketBuffer[@scope]?.length > 0
-      ip = @nodeInstance.bracketBuffer[@scope][0]
+    while @nodeInstance.bracketBuffer[port][@scope]?.length > 0
+      ip = @nodeInstance.bracketBuffer[port][@scope][0]
       if ip.type is 'openBracket'
-        @bracketsToForward.push @nodeInstance.bracketBuffer[@scope].shift()
+        @bracketsToForward[port].push @nodeInstance.bracketBuffer[port][@scope].shift()
         hasOpening = true
       else
         break if hasOpening
         # Closing brackets from previous execution need to be forwarded
-        @bracketsToForward.push @nodeInstance.bracketBuffer[@scope].shift()
+        @bracketsToForward[port].push @nodeInstance.bracketBuffer[port][@scope].shift()
 
-  prepareCloseBrackets: ->
-    @bracketsToForward = []
-    while @nodeInstance.bracketBuffer[@scope]?.length > 0
-      ip = @nodeInstance.bracketBuffer[@scope][0]
+  prepareCloseBrackets: (port) ->
+    @bracketsToForward[port] = []
+    while @nodeInstance.bracketBuffer[port][@scope]?.length > 0
+      ip = @nodeInstance.bracketBuffer[port][@scope][0]
       if ip.type is 'closeBracket'
-        @bracketsToForward.push @nodeInstance.bracketBuffer[@scope].shift()
+        @bracketsToForward[port].push @nodeInstance.bracketBuffer[port][@scope].shift()
       else
         break
 
   # Sends packets for each port as a key in the map
   # or sends Error or a list of Errors if passed such
   send: (outputMap) ->
-    # Prepare brackets to be forwareded
-    @prepareOpenBrackets() unless @bracketsToForward
     if (@nodeInstance.ordered or @nodeInstance.autoOrdering) and
     not ('__resolved' of @result)
       @activate()
@@ -372,9 +376,11 @@ class ProcessOutput
       outputMap[componentPorts[0]] = ip
 
     for port, packet of outputMap
+      # Prepare brackets to be forwareded
       if @nodeInstance.forwardBracketsTo.indexOf(port) isnt -1 and @forwardedBracketsTo.indexOf(port) is -1
         # Forward openening brackets before sending data
-        for ip in @bracketsToForward
+        @prepareOpenBrackets port
+        for ip in @bracketsToForward[port]
           @sendIP port, ip
           if ip.type is 'openBracket'
             @nodeInstance.incFwdCounter ip.scope, port
@@ -407,19 +413,18 @@ class ProcessOutput
     # This makes buffer grow and results into empty brackets
     # if @forwardedBracketsTo.length is 0 and @bracketsToForward.length
     #   @nodeInstance.bracketBuffer[@scope] = @bracketsToForward.concat @nodeInstance.bracketBuffer[@scope]
-    if @forwardedBracketsTo.length > 0
-      @prepareCloseBrackets()
+    for port in @forwardedBracketsTo
+      @prepareCloseBrackets port
       # Forward closing brackets to any ports that we have sent to
-      if @bracketsToForward.length > 0
-        for port in @forwardedBracketsTo
-          for ip in @bracketsToForward
-            @sendIP port, ip
-            if ip.type is 'openBracket'
-              @nodeInstance.incFwdCounter ip.scope, port
-            else
-              @nodeInstance.decFwdCounter ip.scope, port
-        @forwardedBracketsTo = []
-      @bracketsToForward = null
+      if @bracketsToForward[port].length > 0
+        for ip in @bracketsToForward[port]
+          @sendIP port, ip
+          if ip.type is 'openBracket'
+            @nodeInstance.incFwdCounter ip.scope, port
+          else
+            @nodeInstance.decFwdCounter ip.scope, port
+      delete @bracketsToForward[port]
+    @forwardedBracketsTo = []
 
     # Flush the queue
     if @nodeInstance.ordered or @nodeInstance.autoOrdering
